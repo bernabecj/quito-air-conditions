@@ -1,0 +1,38 @@
+[tool.poetry]
+name = "airquito"
+version = "0.1.0"
+description = "Live air quality and alert service for Quito, built on OpenAQ, Kafka and Delta Lake"
+authors = ["bernabecj"]
+license = "MIT"
+readme = "README.md"
+packages = [{ include = "producers" }]
+
+[tool.poetry.dependencies]
+# Databricks serverless runs 3.11/3.12, so the shared code must import on both.
+python = ">=3.11,<3.13"
+requests = "^2.32"
+python-dotenv = "^1.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2"
+pytest-cov = "^5.0"
+black = "^24.4"
+isort = "^5.13"
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Lets the tests import producers/ without the project being pip-installed.
+pythonpath = ["."]
+addopts = "-v --cov=producers --cov-report=term-missing"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

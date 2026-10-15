@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.pytest_cache/
+.venv/
+venv/
+dist/
+build/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Local data pulled from the APIs while exploring
+data/local/
+
+# Next.js (web/)
+node_modules/
+.next/
+.vercel/
+
+# IDE
+.vscode/
+.idea/
+.claude/
+.codebase-memory/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
