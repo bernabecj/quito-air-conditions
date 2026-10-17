@@ -4,8 +4,12 @@ This is the planning doc for AirQuito: the pitch, the data sources, the target
 architecture and the phased build plan. For setup instructions and what exists
 today, see the [README](../README.md).
 
-**Status:** Phase 0 (setup) done, Phase 1 not started.
-**Created:** 2026-10-15
+**Status:** Phase 0 (setup) done. Phase 1 in progress: producers, tests,
+exploration notebook and docs are done (Stage 1); the Delta tables, the Postgres
+push and the site are next. The primary source changed from OpenAQ to the
+Secretaría de Ambiente's own portal, see section 3 and
+[docs/ANALYSIS.md](ANALYSIS.md).
+**Created:** 2026-10-15. **Updated:** 2026-10-17.
 
 **The idea:** a continuously running data pipeline that reads Quito's public air
 quality measurements, stores them in a lakehouse, publishes a free public
@@ -50,35 +54,55 @@ masking and retention rules.
 
 ## 3. Data sources
 
-### Primary: OpenAQ
-- API version 3, requires a free key, sent in the `X-API-Key` header.
-- Base: `https://api.openaq.org/v3`
-- Ecuador is country id `137`.
-- Covers fine particulate matter (PM2.5), respirable particulate matter (PM10),
-  ozone, nitrogen dioxide, sulphur dioxide, carbon monoxide, plus humidity and
-  temperature for some stations.
-- Values come in physical units, not as an index. The index is computed by us.
-- All data served through the interface is public, with near real time and
-  historical coverage.
-- Underlying network for Quito: Red Metropolitana de Monitoreo Atmosférico,
-  managed by the Secretaría de Ambiente of the Municipio del Distrito
-  Metropolitano de Quito. Roughly ten stations (Cotocollao, Centro, Belisario,
-  Carapungo, El Camal, Guamaní, Los Chillos, Tumbaco, Jipijapa, San Antonio).
-  **Not yet verified against the API**: confirming which of these OpenAQ
-  actually exposes, and how recently each reported, is Phase 1 step 1
-  (`scripts/discover_stations.py`).
+### Primary: REMMAQ through the Secretaría de Ambiente portal
 
-Endpoints that matter:
-- `/v3/countries/137` to confirm available parameters.
-- `/v3/locations?coordinates=-0.1807,-78.4678&radius=25000` to list Quito stations.
-- `/v3/sensors/{id}/measurements` for history per sensor.
-- `/v3/locations/{id}/latest` for the current values.
+The Red Metropolitana de Monitoreo Atmosférico de Quito (REMMAQ), run by the
+Secretaría de Ambiente of the Municipio del Distrito Metropolitano de Quito.
+Nine stations: Belisario, Carapungo, Centro, Cotocollao, El Camal, Guamaní,
+Los Chillos, San Antonio, Tumbaco. (Jipijapa, in the first draft of this plan,
+exists in no source.)
+
+- **Live values**: `aireambiente.quito.gob.ec`, an Envista ARM web portal. Its
+  map is fed by an ASP.NET page method, `POST .../Modules/Maps/GoogleMap.aspx/GetSitesInfo`
+  with body `{}`, which returns every station's latest hourly values for eleven
+  layers (CO, NO₂, O₃, SO₂, PM2.5, PM10, temperature, solar radiation, rain,
+  wind speed and direction) plus the station IQCA with its health advisory. No
+  key. Values appear about 70 minutes after the hour. Found by reading the
+  page's JavaScript with `scripts/probe_sources.py`; it is not a documented API,
+  and the data contract records that risk.
+- **History**: `datosambiente.quito.gob.ec`, one `.rar` per parameter with a
+  validated (`LIMPIO`) hourly xlsx since 2004, plus the network's QA/QC protocol
+  ([summary](remmaq-qaqc.md)). Used for backfill and for the exploration notebook.
+- Units: CO in mg/m³, other pollutants in µg/m³. The feed's IQCA (Índice
+  Quiteño de Calidad del Aire) is usable for "now"; the full breakpoint table is
+  still to be obtained for history and alerts.
+- Verified 2026-10-16. Evidence and details: [docs/ANALYSIS.md](ANALYSIS.md),
+  [docs/data-contracts.md](data-contracts.md), `notebooks/01_exploring.ipynb`.
+
+### Demoted: OpenAQ
+- The original primary source. API v3, free key in the `X-API-Key` header,
+  base `https://api.openaq.org/v3`, Ecuador country id `137`.
+- **Stale for Quito**: the REMMAQ stations stopped syncing on 2021-11-24 and the
+  two AirGradient sensors in 2025. Confirmed with `/locations/{id}/latest` on
+  2026-10-16.
+- The client (`producers/openaq.py`) and `scripts/discover_stations.py` stay as
+  the record of the discovery. No producer reads OpenAQ.
 
 ### Secondary: weather
-- Open-Meteo, free, no key required.
-- `https://api.open-meteo.com/v1/forecast?latitude=-0.1807&longitude=-78.4678&current=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m`
+- Open-Meteo, free, no key required, updated every 15 minutes.
+- One request for all nine station coordinates:
+  `https://api.open-meteo.com/v1/forecast?latitude=…&longitude=…&current=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m&timezone=UTC`
 - Wind and temperature explain most pollution spikes, especially thermal
-  inversions. This turns a dashboard into an explanation.
+  inversions. This turns a dashboard into an explanation. REMMAQ's own
+  meteorological layers take precedence where both exist; Open-Meteo is the
+  gridded complement.
+- Open-Meteo's air quality endpoint (Copernicus CAMS model, 0.1° grid, 5-day
+  forecast) is reserved for a later phase as a city-level forecast layer.
+
+### Checked and rejected as live sources (2026-10-16)
+- **AirGradient open data**: 2 906 sensors worldwide, none within 25 km of Quito.
+- **Sensor.Community**: no sensors in the area.
+- **PurpleAir**: not probed, needs a key. Low expected coverage.
 
 ### Do not build on aqicn.org (World Air Quality Index)
 It is the easiest option and it is a trap. Its usage policy forbids caching and
@@ -99,7 +123,7 @@ wrong.
 ## 4. Architecture
 
 ```
-OpenAQ API ─────┐
+REMMAQ portal ──┐
                 ├──► Python producers ──► Kafka ──┐
 Open-Meteo API ─┘                                 │
                                                   ├──► Databricks (Delta)
@@ -115,7 +139,7 @@ Postgres (subscribers) ──► Debezium ──► Kafka ────┘    bro
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Producers | Python, one per source | Run on GitHub Actions cron or a small Fly.io machine |
+| Producers | Python, one per source, stateless, at-least-once | GitHub Actions cron every 10 min (`.github/workflows/producers.yml`); Lambda + EventBridge is the documented alternative |
 | Broker | Confluent Cloud free tier | Already familiar from FinGuard. Redpanda Serverless is the alternative |
 | Operational database | Postgres on Supabase or Neon, free tier | Subscribers, thresholds, delivery log |
 | Change capture | Debezium reading the Postgres write ahead log | Produces the subscriber change stream |
@@ -136,39 +160,71 @@ data. It exists here because the product needs it, not as a demonstration.
 ### Kafka topics
 | Topic | Key | Contents |
 |---|---|---|
-| `aq.measurements.raw` | sensor id | One record per sensor reading, as returned by the source |
-| `weather.current.raw` | station id | Current conditions near each station |
+| `aq.measurements.raw` | station id (REMMAQ GUID) | One record per station per poll: the site document with all layers, as returned by the source |
+| `weather.current.raw` | station id (same GUID) | Current conditions at each station's coordinates |
 | `subscribers.cdc` | subscriber id | Debezium change events from Postgres |
 | `alerts.outbound` | subscriber id | Alerts decided by the pipeline, consumed by the bot |
 | `alerts.delivery` | subscriber id | Delivery result, success or failure, with latency |
 
-Topic names live in [`producers/config.py`](../producers/config.py).
+Topic names live in [`producers/config.py`](../producers/config.py); the
+message envelope and payload shapes are in [data-contracts.md](data-contracts.md).
 
 ### Delta tables
 
-**Bronze**
-- `bronze.measurements`: exact payload plus ingestion timestamp and source name.
-  Append only, nothing dropped, nothing cast.
-- `bronze.weather`: same approach.
+All tables are Delta (parquet files plus a transaction log) in Unity Catalog. What
+distinguishes the layers is the *content*, not the file format: Bronze keeps the
+source record exactly as it arrived, in whatever shape the source used; Silver
+holds typed, long-format, deduplicated rows; Gold holds what the product reads.
+
+**Landing formats, before Bronze**
+| Source | Arrives as | Path into Bronze |
+|---|---|---|
+| REMMAQ live feed | JSON document per station, inside the producer envelope | Kafka `aq.measurements.raw` → triggered micro-batch |
+| Open-Meteo | JSON per station, inside the envelope | Kafka `weather.current.raw` → same job |
+| REMMAQ history | xlsx, one workbook per parameter, sheet `LIMPIO`, wide (one column per station), local time | one-off backfill job reading the files from a volume |
+| Subscribers | Debezium change events (JSON) | Kafka `subscribers.cdc` |
+
+**Bronze** (append only, nothing dropped, nothing cast)
+- `bronze.measurements`: one row per Kafka record: `key`, `topic`, `partition`,
+  `offset`, `kafka_timestamp`, the envelope fields (`source`, `schema_version`,
+  `event_time`, `fetched_at`) and `payload` as the raw JSON string. Keeping the
+  payload as a string rather than a struct means a new field from the source
+  never fails the write.
+- `bronze.measurements_history`: the xlsx rows as read, one row per workbook row
+  with the original timestamp (local, drifting), the original column headers,
+  plus `source_file` and `loaded_at`. Wide format preserved.
+- `bronze.weather`: same approach as `bronze.measurements`.
 - `bronze.subscribers_cdc`: raw change events, including the operation type.
 
-**Silver**
-- `silver.measurements`: one row per station, parameter and measurement time.
-  Deduplicated on that key. Units normalised. Obvious bad values quarantined
-  rather than deleted, for example negative concentrations or values far outside
-  the plausible range.
-- `silver.stations`: station reference data, slowly changing, type 2.
-- `silver.subscribers`: current state of each subscriber, rebuilt from the change
-  stream with a merge. Personal fields masked in this layer.
-- `silver.measurements_quarantine`: rejected rows with the reason. Never silently
-  discard.
+**Silver** (typed, long format, one row per natural key)
+- `silver.measurements`: one row per `(station_id, parameter, event_hour_utc)`.
+  Columns: `station_id`, `parameter`, `event_hour_utc`, `value`, `unit`,
+  `is_valid_at_source`, `quality_flags` (array: `mad`, `tail`), `origin`
+  (`live` or `history`), `ingested_at`. Built from Bronze by: exploding the
+  feed's `LayerInfos`; unpivoting the history; **rounding** history timestamps
+  to the nearest hour and converting from `America/Guayaquil` to UTC;
+  deduplicating on the key, live over history when both exist. Rules from
+  `notebooks/01_exploring.ipynb`, section 3, 4 and 9.
+- `silver.measurements_quarantine`: rows rejected by the physical-limit or
+  spike rules, with `rule`, `threshold`, `value` and the Bronze reference.
+  Never silently discard.
+- `silver.stations`: station reference, slowly changing type 2, with a
+  per-parameter availability window (`first_value`, `last_value`) rather than a
+  single active flag.
+- `silver.weather`: one row per `(station_id, event_time_utc)`.
+- `silver.subscribers`: current state of each subscriber, rebuilt from the
+  change stream with a merge. Personal fields masked in this layer.
 
 **Gold**
-- `gold.station_latest`: current value and computed index per station.
-- `gold.station_hourly`: hourly averages, the table the charts read.
+- `gold.station_latest`: current value, source IQCA and category per station,
+  plus `freshness_minutes` and a `status` of `ok`, `stale`, `down` or
+  `not_measured` per parameter.
+- `gold.station_hourly`: hourly series the charts read, with 24 h rolling
+  PM2.5 and 8 h rolling O3 and CO for index computation.
 - `gold.alert_candidates`: crossings detected, before the subscriber join.
-- `gold.pipeline_health`: freshness per source, rows processed, quarantine rate,
-  alert delivery latency. This is the table that proves the pipeline is alive.
+- `gold.pipeline_health`: publication delay per poll, rows processed, stations
+  offline, quarantine rate, alert delivery latency. This is the table that
+  proves the pipeline is alive.
 
 ### Postgres (operational)
 ```sql
@@ -239,7 +295,8 @@ as a tutorial exercise.
 - A short data contract for each source: fields, types, update frequency,
   expected ranges, what happens on violation.
 - Attribution on the public site: data from the Red Metropolitana de Monitoreo
-  Atmosférico via OpenAQ, with a link.
+  Atmosférico, Secretaría de Ambiente del DMQ, with a link to
+  `ambiente.quito.gob.ec`; weather by Open-Meteo.
 - A plain privacy note on the site saying what is stored and how to delete it.
 
 ---
@@ -257,19 +314,39 @@ thing.
 - [x] `scripts/discover_stations.py` to list the stations and sensors around Quito.
 
 ### Phase 1, about two weeks, this is the one that matters
-- [ ] Get an OpenAQ key, run `scripts/discover_stations.py`, confirm the Quito
-      stations and their sensor ids. Record the result in this doc.
-- [ ] Producer one: poll OpenAQ, write to `aq.measurements.raw`.
-- [ ] Bronze table, append only.
-- [ ] Silver table with deduplication on station, parameter and measurement time.
-- [ ] Gold table `station_latest`.
+
+Stage 1 (done, 2026-10-17):
+- [x] Run `scripts/discover_stations.py`; found OpenAQ stale since 2021.
+- [x] `scripts/probe_sources.py`: probe every candidate; found the REMMAQ portal
+      and its page method; confirmed the network is live.
+- [x] Producer one: `producers/remmaq_producer.py` → `aq.measurements.raw`.
+- [x] Producer two (pulled forward from Phase 2): `producers/weather_producer.py`
+      → `weather.current.raw`.
+- [x] Shared producer code: envelope, file and Kafka sinks, polite HTTP with
+      retry, env-driven settings, runner CLI with `--loop`.
+- [x] Deployment: GitHub Actions cron every 10 minutes, file-sink dry run on demand.
+- [x] Exploration notebook `notebooks/01_exploring.ipynb` over 22 years of history
+      and the live feed; rules for Silver derived from it.
+- [x] Tests: 98, no network, real captured payloads as fixtures. CI runs them.
+- [x] Docs: `ANALYSIS.md`, `data-contracts.md`, this plan, README.
+
+Stage 2 (next):
+- [ ] Create the Kafka cluster (Confluent Cloud or Redpanda), the two topics,
+      the GitHub secrets; first real send; confirm records in the topic.
+- [ ] Bronze: `bronze.measurements` and `bronze.weather` from Kafka, triggered
+      micro-batch every 10 minutes; `bronze.measurements_history` from the xlsx.
+- [ ] Silver: `silver.measurements` (explode, unpivot, round, UTC, dedup),
+      `silver.measurements_quarantine`, `silver.stations`, `silver.weather`.
+- [ ] Gold: `station_latest` with `status` per parameter, `pipeline_health`.
+- [ ] Obtain the IQCA breakpoint table and the remaining history exports
+      (CO, SO₂, PM10).
 - [ ] Push gold to Postgres.
 - [ ] One page site with the map and current values. **Deploy it.**
 - [ ] Link the live site from the README.
 
 ### Phase 2, about one week
-- [ ] Producer two: weather.
-- [ ] Hourly aggregates and the trend charts.
+- [ ] Hourly aggregates and the trend charts, backfilled from the history.
+- [ ] Open-Meteo CAMS forecast layer (city level).
 - [ ] Quarantine table and basic data quality checks with Great Expectations.
 - [ ] `pipeline_health` table and a freshness indicator shown on the site.
 
@@ -297,16 +374,27 @@ added by the phase that needs them.
 ```
 quito-air-conditions/
   producers/
-    config.py              (exists) coordinates, endpoints, topic names
-    openaq.py              (exists) OpenAQ v3 client
-    openaq_producer.py
-    weather_producer.py
+    config.py              (exists) endpoints, coordinates, topic names, schema version
+    settings.py            (exists) env-driven runtime settings, Kafka config
+    http.py                (exists) session with User-Agent and retry policy
+    stations.py            (exists) station reference: GUID, feed name, xlsx header, coordinates
+    envelope.py            (exists) message envelope and serialisation
+    sinks.py               (exists) FileSink and KafkaSink
+    runner.py              (exists) CLI, run loop, exit codes
+    remmaq.py              (exists) REMMAQ client
+    openmeteo.py           (exists) Open-Meteo client
+    remmaq_producer.py     (exists) producer one
+    weather_producer.py    (exists) producer two
+    openaq.py              (exists) OpenAQ client, discovery only
   pipelines/
     bronze_measurements.py
+    bronze_history.py
     silver_measurements.py
     silver_subscribers.py
     gold_station_latest.py
     gold_alerts.py
+  notebooks/
+    01_exploring.ipynb     (exists) data exploration, findings and Silver rules
   bot/
     telegram_consumer.py
   web/
@@ -314,14 +402,21 @@ quito-air-conditions/
   infra/
     debezium-connector.json
   scripts/
-    discover_stations.py   (exists) Phase 1 step 1
-  tests/                   (exists, empty) pytest is configured in pyproject.toml
+    discover_stations.py   (exists) OpenAQ station listing
+    probe_sources.py       (exists) source freshness probe
+  tests/                   (exists) 98 tests, fixtures are real captures
   docs/
     PROJECT_PLAN.md        (exists) this file
+    ANALYSIS.md            (exists) sources, discoveries, objectives
+    data-contracts.md      (exists) topic envelopes and payload shapes
+    STAGE1_HANDOVER.md     (exists) changes, how to verify, how to break the tests
     architecture.md
-    data-contracts.md
     decisions.md
-  .github/workflows/       (exists) CI
+  .github/workflows/
+    ci.yml                 (exists) format, requirements sync, tests
+    producers.yml          (exists) cron every 10 minutes
+  data/local/              gitignored: probe output, history files, file-sink output
+  requirements.txt         (exists) exported from poetry.lock
   README.md                (exists)
 ```
 
@@ -330,10 +425,15 @@ quito-air-conditions/
 ## 11. Open decisions
 
 - Kafka: Confluent Cloud free tier or Redpanda Serverless. Confluent is the
-  known path, Redpanda has a simpler free tier.
-- Which air quality index to use. The United States Environmental Protection
-  Agency index is the most recognised, but Ecuador has its own index. Showing
-  both, or showing the raw value with a plain language label, may be more honest.
+  known path, Redpanda has a simpler free tier. The producer's `KafkaSink`
+  works with either (SASL_SSL / PLAIN).
+- Producer scheduler: GitHub Actions cron is the version-one choice; Lambda +
+  EventBridge if Actions' cron jitter becomes a problem.
+- Which air quality index to show. The feed provides the IQCA (Quito's own
+  index) with health text, so that is the default for "now". For trends and
+  alerts the full IQCA breakpoint table is needed; showing the WHO 2021
+  guideline alongside is more honest, since the notebook shows 30 % of
+  station-days exceed WHO while almost none exceed the national limit.
 - Whether to name the nearest station by neighborhood rather than by station
   name, which is friendlier but introduces a mapping to maintain.
 - Domain name, or just use the free Vercel subdomain for version one.

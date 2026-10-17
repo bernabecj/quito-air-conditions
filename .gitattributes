@@ -1,0 +1,5 @@
+# Normalise line endings in the repository; checkouts follow the platform.
+* text=auto
+*.ipynb text eol=lf
+*.xlsx binary
+*.pdf binary

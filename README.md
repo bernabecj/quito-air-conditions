@@ -4,7 +4,7 @@ Live air quality and alert service for Quito. A continuously running pipeline re
 
 ![CI](https://github.com/bernabecj/quito-air-conditions/actions/workflows/ci.yml/badge.svg)
 
-> **Status: early setup.** The repository, tooling, CI and an OpenAQ client are in place. No pipeline runs yet. See [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) for the full plan and the phase checklist.
+> **Status: Phase 1, Stage 1 done.** Two producers (REMMAQ measurements, Open-Meteo weather) with file and Kafka sinks, a GitHub Actions cron to run them every 10 minutes, 98 tests, and an exploration notebook over 22 years of Quito's air quality history. No Delta tables or site yet. See [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md) for the phase checklist, [docs/ANALYSIS.md](docs/ANALYSIS.md) for what was learned about the data, and [docs/STAGE1_HANDOVER.md](docs/STAGE1_HANDOVER.md) for how to verify everything.
 
 ---
 
@@ -25,7 +25,7 @@ Live air quality and alert service for Quito. A continuously running pipeline re
 ## Architecture
 
 ```
-OpenAQ API ─────┐
+REMMAQ portal ──┐
                 ├──► Python producers ──► Kafka ──┐
 Open-Meteo API ─┘                                 │
                                                   ├──► Databricks (Delta)
@@ -43,7 +43,7 @@ The core of the design is a stream to table join: hourly measurements meet the s
 
 | Layer | Choice |
 |---|---|
-| Producers | Python, one per source, on a GitHub Actions cron or a small Fly.io machine |
+| Producers | Python, one per source, stateless, at-least-once; GitHub Actions cron every 10 minutes |
 | Broker | Confluent Cloud free tier (Redpanda Serverless as the alternative) |
 | Operational database | Postgres on Supabase or Neon |
 | Change capture | Debezium on the Postgres write ahead log |
@@ -54,7 +54,7 @@ The core of the design is a stream to table join: hourly measurements meet the s
 
 ### Why Kafka in front of hourly data?
 
-Reference stations publish about once per hour, so this is not sub second streaming and does not claim to be. The broker is there because two sources fan in and two consumers fan out, and because replay matters. Processing runs as a triggered micro batch every few minutes rather than a continuous stream, since continuous compute is not justified by an hourly source. [Section 7 of the plan](docs/PROJECT_PLAN.md#7-known-weakness-and-how-to-answer-it) covers this in full.
+Reference stations publish once per hour, about 70 minutes after the hour, so this is not sub second streaming and does not claim to be. The broker is there because two sources fan in and two consumers fan out, and because replay matters. Producers are short-lived processes that poll every 10 minutes and exit; processing runs as a triggered micro batch rather than a continuous stream, since continuous compute is not justified by an hourly source. [Section 7 of the plan](docs/PROJECT_PLAN.md#7-known-weakness-and-how-to-answer-it) covers this in full.
 
 ---
 
@@ -62,52 +62,101 @@ Reference stations publish about once per hour, so this is not sub second stream
 
 | Source | What it provides | Access |
 |---|---|---|
-| [OpenAQ v3](https://docs.openaq.org/) | PM2.5, PM10, O₃, NO₂, SO₂, CO from Quito's Red Metropolitana de Monitoreo Atmosférico | Free key, `X-API-Key` header |
-| [Open-Meteo](https://open-meteo.com/) | Temperature, humidity, wind speed and direction | Free, no key |
+| **REMMAQ** via the Secretaría de Ambiente portal (`aireambiente.quito.gob.ec`) | Hourly PM2.5, PM10, O₃, NO₂, SO₂, CO, temperature, solar radiation, rain, wind, and the IQCA index with health advisories, for nine stations | One unauthenticated POST to the map's page method. Not a documented API; see [the data contract](docs/data-contracts.md) |
+| **REMMAQ history** (`datosambiente.quito.gob.ec`) | Validated hourly series since 2004, one xlsx per parameter | Manual download, loaded by a backfill job |
+| [Open-Meteo](https://open-meteo.com/) | Temperature, humidity, wind speed and direction at each station's coordinates | Free, no key |
 
-OpenAQ returns physical units, not an index. The index is computed in the pipeline.
-
-**Not used: aqicn.org.** Its terms forbid caching and redistributing the data, and this project exists to store history. It is only used as a manual cross check.
+**Not used: OpenAQ.** The plan started there, but its Quito stations stopped updating in November 2021. The client stays in `producers/openaq.py` as the record of that discovery. **Not used: aqicn.org.** Its terms forbid caching and redistributing the data, and this project exists to store history; it served once as a manual cross check that REMMAQ was still publishing.
 
 ---
 
 ## Getting started
 
-Requires Python 3.11 and [Poetry](https://python-poetry.org/).
+Requires Python 3.11 or 3.12 and Java 17 or 21 (only for the exploration notebook).
+
+**With Poetry** (the source of truth for dependencies):
 
 ```bash
-poetry install --with dev        # creates .venv/ in the project (see poetry.toml)
-cp .env.example .env             # then add your OpenAQ key
+poetry install --with dev               # producers, tests, formatting; creates .venv/
+poetry install --with dev,notebook      # plus PySpark and Jupyter for notebooks/
+cp .env.example .env                    # then fill in the keys you have
 ```
 
-Get a free OpenAQ key at [explore.openaq.org/register](https://explore.openaq.org/register).
-
-List the stations around Quito and the sensors each one carries:
+**With a plain venv** (sandboxes, Databricks, anywhere without Poetry). `requirements.txt`
+is exported from `poetry.lock` and CI fails if the two drift:
 
 ```bash
-poetry run python -m scripts.discover_stations
-poetry run python -m scripts.discover_stations --json data/local/quito_sensors.json
+python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-Format and test:
+After changing dependencies: `poetry lock`, then
+`poetry export --with dev,notebook --without-hashes -o requirements.txt`
+(needs `poetry self add poetry-plugin-export` once), keeping the comment header.
+
+### Run a producer
+
+Each producer polls its source once, publishes, prints a JSON summary and exits. With
+`SINK=file` (the default) records go to `data/local/sink/<topic>/<run>.jsonl`, which
+`spark.read.json` reads directly; with `SINK=kafka` they go to the cluster in `.env`.
 
 ```bash
-poetry run black . && poetry run isort .
-poetry run pytest
+python -m producers.remmaq_producer                    # REMMAQ → aq.measurements.raw
+python -m producers.weather_producer                   # Open-Meteo → weather.current.raw
+python -m producers.remmaq_producer --sink file --out-dir /tmp/out
+python -m producers.remmaq_producer --loop 600         # keep polling every 10 minutes
 ```
 
-CI runs the same formatting check and pytest on every push and pull request.
+Exit code 1 means the source was unreachable after three attempts, answered in an
+unexpected shape, or the sink could not confirm delivery. In production the same two
+commands run from `.github/workflows/producers.yml` every 10 minutes; trigger it by hand
+with `sink=file` to get the records as a downloadable artifact before a Kafka cluster exists.
+
+### Explore the data
+
+`notebooks/01_exploring.ipynb` runs on Databricks (data in a Unity Catalog volume) or
+locally with PySpark. It needs the history xlsx files and a probe capture under
+`data/local/`; see [docs/STAGE1_HANDOVER.md](docs/STAGE1_HANDOVER.md) for both paths.
+
+```bash
+cd notebooks && AIRQUITO_DATA_ROOT=../data/local jupyter nbconvert --to notebook --execute --inplace 01_exploring.ipynb
+```
+
+### Source discovery scripts
+
+`scripts/probe_sources.py` makes one polite request per candidate data source and writes
+a freshness report to `data/local/probe/`. This is how the live REMMAQ feed was found
+after OpenAQ turned out to be stale (see [docs/ANALYSIS.md](docs/ANALYSIS.md)).
+
+```bash
+python -m scripts.probe_sources                       # all sources, 3 s between requests
+python -m scripts.probe_sources --only secretaria --timeout 60
+```
+
+`scripts/discover_stations.py` lists the OpenAQ stations around Quito (needs `OPENAQ_API_KEY`).
+
+### Format and test
+
+```bash
+black . && isort .
+pytest                                                 # 98 tests, no network, < 1 s
+```
+
+CI runs the formatting check, the `requirements.txt` sync check and pytest on every push
+and pull request.
 
 ---
 
 ## Repository layout
 
 ```
-producers/        source clients and producers (OpenAQ client today)
-scripts/          one-off tools, e.g. station discovery
-tests/            unit tests, pytest configured in pyproject.toml
-docs/             project plan, later architecture, data contracts and decisions
-.github/workflows CI
+producers/        clients, envelope, sinks, runner and the two producers
+notebooks/        01_exploring.ipynb, the data exploration record
+scripts/          probe_sources.py (source freshness), discover_stations.py (OpenAQ)
+tests/            98 tests; fixtures are real captures from the sources
+docs/             PROJECT_PLAN, ANALYSIS, data-contracts, STAGE1_HANDOVER
+.github/workflows ci.yml (checks) and producers.yml (cron every 10 minutes)
+data/local/       gitignored: probe output, history files, file-sink output
 ```
 
 `pipelines/`, `bot/`, `web/` and `infra/` arrive with the phases that need them. The target layout is in [the plan](docs/PROJECT_PLAN.md#10-repository-layout).
@@ -116,7 +165,7 @@ docs/             project plan, later architecture, data contracts and decisions
 
 ## Data attribution
 
-Air quality data from the Red Metropolitana de Monitoreo Atmosférico (Secretaría de Ambiente, Municipio del Distrito Metropolitano de Quito) via [OpenAQ](https://openaq.org/). Weather data from [Open-Meteo](https://open-meteo.com/).
+Air quality data from the Red Metropolitana de Monitoreo Atmosférico (Secretaría de Ambiente, Municipio del Distrito Metropolitano de Quito), [ambiente.quito.gob.ec](https://ambiente.quito.gob.ec/). Weather data from [Open-Meteo](https://open-meteo.com/).
 
 ## License
 

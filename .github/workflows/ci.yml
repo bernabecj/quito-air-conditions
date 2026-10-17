@@ -43,7 +43,15 @@ jobs:
                   black --check .
                   isort --check-only .
 
-            # Tests must run without network or an API key. Exit code 5 means
-            # "no tests collected", accepted until the first test lands in tests/.
+            # requirements.txt is the single pip-installable view of poetry.lock,
+            # used where Poetry is not available (sandbox venv, Databricks).
+            # It must never drift from the lock.
+            - name: Check requirements.txt matches poetry.lock
+              run: |
+                  poetry self add poetry-plugin-export
+                  diff <(poetry export --with dev,notebook --without-hashes) <(grep -v '^#' requirements.txt)
+
+            # Tests run without network or API keys: every HTTP call is mocked
+            # with `responses` against real captured payloads in tests/fixtures.
             - name: Run pytest
-              run: pytest || [ $? -eq 5 ]
+              run: pytest

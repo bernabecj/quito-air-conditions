@@ -1,7 +1,9 @@
 """
 OpenAQ client
-Thin wrapper over the OpenAQ v3 endpoints the pipeline needs. The producer
-(Phase 1) and scripts/discover_stations.py both build on it.
+Thin wrapper over the OpenAQ v3 endpoints. Kept for scripts/discover_stations.py
+and as the record of the discovery that OpenAQ's Quito stations stopped
+updating in November 2021 (docs/ANALYSIS.md). No producer reads OpenAQ; the
+live source is the REMMAQ portal (producers/remmaq.py).
 
 Responses are returned as parsed JSON, untouched. Bronze stores the payload
 exactly as the source sent it, so nothing here casts, renames or drops fields;

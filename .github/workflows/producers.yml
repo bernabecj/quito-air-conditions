@@ -1,0 +1,67 @@
+name: Producers
+
+# The deployment of Phase 1: every ten minutes, poll the sources and publish to
+# Kafka. REMMAQ publishes hourly, about 70 minutes after the hour, so a ten
+# minute cadence sees each new value within minutes of publication. GitHub's
+# cron can run a few minutes late under load, which is fine for this source.
+#
+# Secrets (repository settings > Secrets and variables > Actions):
+#   KAFKA_BOOTSTRAP_SERVERS, KAFKA_SASL_USERNAME, KAFKA_SASL_PASSWORD
+# Until the cluster exists, run it by hand with sink=file to get the records
+# as a downloadable artifact.
+
+on:
+    schedule:
+        - cron: "*/10 * * * *"
+    workflow_dispatch:
+        inputs:
+            sink:
+                description: "file (dry run, artifact) or kafka"
+                default: file
+                type: choice
+                options: [file, kafka]
+
+concurrency:
+    group: producers
+    cancel-in-progress: false
+
+jobs:
+    poll:
+        name: Poll sources
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        env:
+            SINK: ${{ github.event_name == 'workflow_dispatch' && inputs.sink || 'kafka' }}
+            FILE_SINK_DIR: data/local/sink
+            KAFKA_BOOTSTRAP_SERVERS: ${{ secrets.KAFKA_BOOTSTRAP_SERVERS }}
+            KAFKA_SASL_USERNAME: ${{ secrets.KAFKA_SASL_USERNAME }}
+            KAFKA_SASL_PASSWORD: ${{ secrets.KAFKA_SASL_PASSWORD }}
+            KAFKA_CLIENT_ID: airquito-producer-gha
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.11"
+                  cache: pip
+                  cache-dependency-path: requirements.txt
+
+            # Only the runtime dependencies; the dev and notebook groups are not needed.
+            - name: Install
+              run: pip install requests python-dotenv confluent-kafka
+
+            - name: REMMAQ measurements
+              run: python -m producers.remmaq_producer
+
+            # Weather runs even if REMMAQ failed: the two sources are independent.
+            - name: Open-Meteo weather
+              if: always()
+              run: python -m producers.weather_producer
+
+            - name: Upload file sink output
+              if: always() && env.SINK == 'file'
+              uses: actions/upload-artifact@v4
+              with:
+                  name: sink-${{ github.run_id }}
+                  path: data/local/sink
+                  if-no-files-found: warn

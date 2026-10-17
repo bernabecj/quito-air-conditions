@@ -12,12 +12,32 @@ packages = [{ include = "producers" }]
 python = ">=3.11,<3.13"
 requests = "^2.32"
 python-dotenv = "^1.0"
+# Kafka client. Bundles librdkafka, so no system library is needed.
+confluent-kafka = "^2.6"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.2"
 pytest-cov = "^5.0"
 black = "^24.4"
 isort = "^5.13"
+# Mocks HTTP at the requests layer, so client tests exercise real headers and
+# bodies without network access.
+responses = "^0.25"
+
+# Exploration notebook only. Not installed in CI (poetry install --with dev).
+# pyspark is pinned exactly to the version the notebook was verified against.
+[tool.poetry.group.notebook]
+optional = true
+
+[tool.poetry.group.notebook.dependencies]
+pyspark = "3.5.8"
+# pyspark 3.5 imports distutils, removed in Python 3.12; setuptools provides it.
+setuptools = "^75.0"
+pyarrow = "^18.1"
+pandas = "^2.2"
+openpyxl = "^3.1"
+ipykernel = "^6.29"
+nbconvert = "^7.16"
 
 [tool.black]
 line-length = 100

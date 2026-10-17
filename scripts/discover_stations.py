@@ -1,9 +1,10 @@
 """
 List the OpenAQ stations around Quito and the sensors each one carries.
 
-Phase 1, step 1: confirm which Red Metropolitana stations OpenAQ actually
-exposes, which parameters they report and when each last reported, before the
-producer is written against them.
+Run on 2026-10-16 as Phase 1 step 1. It showed that every REMMAQ station on
+OpenAQ last reported on 2021-11-24, which is why the producers read the
+Secretaría de Ambiente's own portal instead (docs/ANALYSIS.md). Kept for
+re-checking whether OpenAQ ever resumes.
 
     python -m scripts.discover_stations
     python -m scripts.discover_stations --json data/local/quito_sensors.json

@@ -2,35 +2,43 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
-.coverage
-.pytest_cache/
+build/
+dist/
+
+# Virtual environments
 .venv/
 venv/
-dist/
-build/
 
-# Environment
+# Secrets
 .env
 .env.*
 !.env.example
 
-# Local data pulled from the APIs while exploring
+# Tooling caches
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local data: discovery output, probe reports, producer file-sink output.
+# Nothing under data/local is committed; fixtures for tests live in tests/fixtures.
 data/local/
 
-# Next.js (web/)
-node_modules/
-.next/
-.vercel/
+# Notebooks
+.ipynb_checkpoints/
 
-# IDE
+# Spark local runs
+metastore_db/
+derby.log
+spark-warehouse/
+
+# Editors and OS
 .vscode/
 .idea/
 .claude/
 .codebase-memory/
-
-# OS
 .DS_Store
 Thumbs.db
-
-# Logs
-*.log
+.break_tests_state.json
